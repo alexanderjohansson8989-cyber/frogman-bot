@@ -1,0 +1,2 @@
+# Only needed when explicitly extracting PDF evidence; not needed for offline tests.
+pdfplumber
