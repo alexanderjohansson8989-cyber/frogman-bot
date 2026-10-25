@@ -11,6 +11,22 @@ from independent_runner import Stop
 class GlobalStop(Stop):
     global_stop=True
 
+@contextlib.contextmanager
+def readback_scope(ledger,key):
+    """Failed verification of an uncertain write is global; never clear or retry it."""
+    try:
+        yield
+    except GlobalStop:
+        raise
+    except Exception as exc:
+        try:
+            row=ledger.db.execute('SELECT state FROM submissions WHERE key=?',(key,)).fetchone()
+        except Exception:
+            raise GlobalStop('Submission readback state unavailable; no retry') from None
+        if row==('uncertain',):
+            raise GlobalStop('Uncertain submission readback failed; no retry') from None
+        raise
+
 def units(value):
     if isinstance(value,(float,bool)):raise GlobalStop('Use exact decimal money')
     try:d=Decimal(value)
@@ -28,7 +44,10 @@ class Ledger:
         self.db.executescript('''CREATE TABLE IF NOT EXISTS policy (singleton INTEGER PRIMARY KEY CHECK(singleton=1),period TEXT NOT NULL,cap INTEGER NOT NULL,stopped INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS operations (key TEXT PRIMARY KEY,kind TEXT NOT NULL,payload_sha TEXT NOT NULL,reserved INTEGER NOT NULL,actual INTEGER,state TEXT NOT NULL,raw TEXT,receipt_sha TEXT);
         CREATE TABLE IF NOT EXISTS submissions (key TEXT PRIMARY KEY,plan_sha TEXT NOT NULL,plan TEXT NOT NULL,state TEXT NOT NULL,receipt TEXT);
-        CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY,contract_sha TEXT NOT NULL,status TEXT NOT NULL,result_sha TEXT);''')
+        CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY,contract_sha TEXT NOT NULL,status TEXT NOT NULL,result_sha TEXT);
+        CREATE TABLE IF NOT EXISTS publications (key TEXT PRIMARY KEY,version TEXT NOT NULL,
+            plan_sha TEXT NOT NULL,plan TEXT NOT NULL,state TEXT NOT NULL,reason TEXT,
+            forecast_verified INTEGER NOT NULL DEFAULT 0,comment_verified INTEGER NOT NULL DEFAULT 0);''')
         try:
             with self.tx():
                 old=self.db.execute('SELECT period,cap FROM policy WHERE singleton=1').fetchone()
@@ -54,16 +73,24 @@ class Ledger:
     def start_session(self,key,contract,minimum_usd):
         with self.tx():
             self.guard()
+            if self.db.execute("SELECT 1 FROM publications WHERE state='pending'").fetchone():
+                raise GlobalStop('Pending publication must finish before new research')
             if self.db.execute('SELECT 1 FROM sessions WHERE key=?',(key,)).fetchone():raise GlobalStop('Question session already attempted')
             if self.db.execute("SELECT 1 FROM sessions WHERE status='active'").fetchone():raise GlobalStop('Another question session is active')
             if units(minimum_usd)>self.available_units():raise GlobalStop('Insufficient budget for complete question')
             self.db.execute("INSERT INTO sessions(key,contract_sha,status) VALUES(?,?,'active')",(key,digest(contract)))
         self.session_key=key
-    def finish_session(self,key,result):
+    def finish_session(self,key,result,publish=False):
+        if type(publish) is not bool:raise GlobalStop('Explicit publication intent required')
         with self.tx():
             self.guard()
             if self.session_key!=key:raise GlobalStop('Question session identity changed')
             if self.db.execute("SELECT status FROM sessions WHERE key=?",(key,)).fetchone()!=('active',):raise GlobalStop('Question session not active')
+            if publish and result.get('status')=='prepared_local_only':
+                # Same SQLite transaction AND durable checkpoint as completion.
+                # Old dry-run rows never acquire publication authority on reopen.
+                from publication_intent_v1 import register
+                register(self,key,result['submission_plan'])
             self.db.execute("UPDATE sessions SET status='complete',result_sha=? WHERE key=?",(digest(result),key))
         self.session_key=None
     def reserve(self,key,kind,payload,reserve_usd):
@@ -114,21 +141,21 @@ class Ledger:
             self.db.execute("UPDATE submissions SET state='verified',receipt=? WHERE key=?",(json.dumps(receipt,ensure_ascii=False,allow_nan=False),key))
 
 class ReservedRequester:
-    """Exactly one search, two needs, one forecast/review per new question run."""
+    """Exactly one search, need, forecast and review per new question run."""
     def __init__(self,ledger,run_key,*,transport,count,guard):
         self.ledger=ledger;self.run_key=run_key;self.transport=transport;self.count=count;self.guard=guard;self.slots={}
     def __call__(self,stage,payload):
-        from candidate_profile_v1 import OUT
+        from candidate_profile_v1 import OUT,EFFORT,STAGE_LIMITS
         from advisor_policy import OPUS,RATES
-        from prospective_runner_4 import cost
-        limits={'search':1,'need':2,'forecast':1,'review':1}
+        from candidate_cost_v1 import cost
+        limits=STAGE_LIMITS
         self.guard();self.ledger.guard()
         slot=self.slots.get(stage,0)
         if stage not in limits or slot>=limits[stage]:raise GlobalStop('Stage slot exhausted')
         p=json.loads(json.dumps(payload,allow_nan=False))
         expected={'model','system','messages','max_tokens','output_config'}|({'tools'} if stage=='search' else set())
         if (set(p)!=expected or p['model']!=OPUS or p['max_tokens']!=OUT[stage]
-            or p['output_config']!={'effort':'medium' if stage=='review' else 'high'}
+            or p['output_config']!={'effort':EFFORT[stage]}
             or not isinstance(p['system'],str) or not isinstance(p['messages'],list) or not p['messages']
             or any(set(m)!={'role','content'} or m['role']!='user' or not isinstance(m['content'],str) for m in p['messages'])):raise GlobalStop('Unreviewed candidate request')
         if stage=='search' and p['tools']!=[dict(type='web_search_20250305',name='web_search',max_uses=2)]:raise GlobalStop('Unreviewed search tools')
@@ -137,16 +164,29 @@ class ReservedRequester:
         if type(n) is not int or not 1<=n<=30000:raise GlobalStop('Full input limit')
         a,b=RATES[OPUS];reserve=Decimal('1.20') if stage=='search' else (Decimal((n*120+99)//100)*a+Decimal(OUT[stage])*b)/1000000
         key=self.run_key+'/'+stage+'/'+str(slot)
-        self.ledger.reserve(key,stage,p,reserve);self.guard();self.ledger.dispatch(key,p);self.slots[stage]=slot+1
+        # These are local state transitions only. Durable ledgers combine their
+        # remote publication; a plain local ledger retains its normal behavior.
+        batch=getattr(self.ledger,'checkpoint_batch',contextlib.nullcontext)
+        with batch():
+            self.ledger.reserve(key,stage,p,reserve)
+            attest=getattr(self.transport,'checkpoint_dispatch_contract',None)
+            if attest is not None:attest(self.ledger,key,p)
+            self.ledger.dispatch(key,p)
+        self.slots[stage]=slot+1
         # The durable checkpoint can block on disk/remote persistence. Recheck
         # immediately before transport; retain uncertain state if time expired.
         self.guard()
         try:raw=self.transport(p)
         except Exception as exc:raise GlobalStop('Transport unknown; reservation retained') from exc
-        self.ledger.save_raw(key,raw)
-        try:amount=cost(raw,OPUS,stage)
-        except Exception as exc:raise GlobalStop('Usage unknown; reservation retained') from exc
-        self.ledger.settle(key,amount,raw);self.guard()
+        with batch():
+            self.ledger.save_raw(key,raw)
+            try:amount=cost(raw,OPUS,stage)
+            except Exception as exc:raise GlobalStop('Usage unknown; reservation retained') from exc
+            self.ledger.settle(key,amount,raw)
+            if raw['usage']['output_tokens']>OUT[stage]:
+                with self.ledger.tx():self.ledger.db.execute('UPDATE policy SET stopped=1')
+                raise GlobalStop('Output exceeded candidate request limit; persistent stop')
+        self.guard()
         if stage!='search' and raw['usage']['input_tokens']>(n*120+99)//100:
             with self.ledger.tx():self.ledger.db.execute('UPDATE policy SET stopped=1')
             raise GlobalStop('Input exceeded counted reserve')

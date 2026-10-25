@@ -10,6 +10,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from bounded_evidence import extract,MAX_BYTES
 from independent_runner import NoRedirect,Stop
+from operations_ledger_v1 import GlobalStop
+from source_failure_v1 import describe
+from source_http_v1 import fetch as fetch_source
+from question_source_links_v1 import criterion_links
 
 
 class ReadableHTML(HTMLParser):
@@ -42,17 +46,14 @@ def capture(url,folder,*,open_request=None,resolver=socket.getaddrinfo):
     name=hashlib.sha256(url.encode()).hexdigest()+'.source'
     target=folder/name
     if target.exists():raise Stop('Source already captured; no silent overwrite')
-    req=urllib.request.Request(url,headers={'User-Agent':'Frogman-bot/1.0 (forecasting research)',
-                                           'Accept-Encoding':'identity'})
     open_request=open_request or urllib.request.build_opener(NoRedirect()).open
-    with open_request(req,timeout=30) as response:
-        if response.geturl()!=url:raise Stop('Unexpected redirected source')
-        if response.headers.get('Content-Encoding','identity').lower() not in ('','identity'):
-            raise Stop('Compressed body not supported')
-        raw=response.read(MAX_BYTES+1)
-        media=response.headers.get_content_type()
-    if len(raw)>MAX_BYTES:raise Stop('Source byte limit; no partial evidence')
+    fetched=fetch_source(url,open_request=open_request,validate_url=lambda u:public_https(u,resolver))
+    raw=fetched['body'];media=fetched['media_type']
     target.write_bytes(raw)
+    wire_name=None
+    if fetched['wire']!=raw:
+        wire_name=hashlib.sha256(url.encode()).hexdigest()+'.wire.source'
+        (folder/wire_name).write_bytes(fetched['wire'])
     captured=dt.datetime.now(dt.timezone.utc).isoformat()
     if raw.startswith(b'%PDF-'):
         src=dict(type='base64',media_type='application/pdf',data=base64.b64encode(raw).decode())
@@ -67,6 +68,10 @@ def capture(url,folder,*,open_request=None,resolver=socket.getaddrinfo):
     doc.update(network_original_sha256=hashlib.sha256(raw).hexdigest(),
                archive_name=name,network_media_type=media,
                network_original_bytes=len(raw),network_fetch_verified=True)
+    doc.update(network_final_url=fetched['final_url'],network_redirects=fetched['redirects'],
+               network_content_encoding=fetched['content_encoding'],
+               network_wire_sha256=hashlib.sha256(fetched['wire']).hexdigest(),
+               network_wire_bytes=len(fetched['wire']),wire_archive_name=wire_name)
     return doc
 
 
@@ -76,14 +81,22 @@ def capture_selected(question,selected_urls,searched_urls,folder,**kwargs):
     allowed=set(searched_urls)
     explicit=question.get('resolution_source')
     if isinstance(explicit,str):allowed.add(explicit)
+    criterion={item['url']:item for item in criterion_links(question)}
+    allowed.update(criterion)
     if any(u not in allowed for u in selected_urls):raise Stop('Source URL lacks search/question provenance')
     documents=[];failures=[]
     for url in selected_urls:
         try:
             d=capture(url,folder,**kwargs)
             d['candidate_origin']='search_result' if url in searched_urls else 'exact_question_resolution_source'
+            if url in criterion:
+                d['candidate_origin']='question_criteria_link'
+                d['question_link_provenance']=criterion[url]
+                d['also_returned_by_search']=url in searched_urls
             documents.append(d)
+        except GlobalStop:
+            raise
         except Exception as error:
             # No automatic paid attempt, alternate address or HTTP bypass.
-            failures.append(dict(url=url,error_type=type(error).__name__,readable=False))
+            failures.append(dict(url=url,**describe(error),readable=False))
     return dict(documents=documents,failures=failures,source_attempts=len(selected_urls))

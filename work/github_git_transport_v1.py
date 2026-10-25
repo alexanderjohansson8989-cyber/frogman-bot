@@ -1,5 +1,6 @@
 """Bounded fixed-origin GitHub Git-data transport. No model/forecast APIs."""
 import base64
+import datetime as dt
 import json
 import re
 import urllib.error
@@ -13,11 +14,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise GlobalStop('GitHub state redirect forbidden')
 
 class GitHubGit:
-    def __init__(self, repository, token, *, timeout=20):
+    def __init__(self, repository, token, *, timeout=20,clock=None):
         if (not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repository)
                 or not isinstance(token,str) or not token.strip() or not 1<=timeout<=30):
             raise GlobalStop('Explicit repository and credential required')
-        self.repo=repository;self._token=token;self.timeout=timeout
+        self.repo=repository;self._token=token;self.timeout=timeout;self.rate_limit={}
+        self.clock=clock or (lambda:dt.datetime.now(dt.timezone.utc))
+        self.rate_observed_utc=None
         self.base='https://api.github.com/repos/'+repository
         self.opener=urllib.request.build_opener(NoRedirect())
 
@@ -31,16 +34,31 @@ class GitHubGit:
             'Content-Type':'application/json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'Frogman-state-v1'})
         try:
             with self.opener.open(req,timeout=self.timeout) as response:
+                self.rate_limit={k:response.headers.get(k) for k in
+                    ('x-ratelimit-limit','x-ratelimit-remaining','x-ratelimit-reset')}
+                self.rate_observed_utc=self.clock().isoformat()
                 data=response.read(2*MAX_FILE+1)
                 if len(data)>2*MAX_FILE:raise GlobalStop('GitHub state response too large')
                 return json.loads(data)
         except urllib.error.HTTPError as exc:
+            self.rate_limit={};self.rate_observed_utc=None
             if missing and exc.code==404:return None
             raise GlobalStop('GitHub state HTTP '+str(exc.code)) from None
         except GlobalStop:raise
         except Exception:
+            self.rate_limit={};self.rate_observed_utc=None
             # Never expose response bodies, request headers or credential text.
             raise GlobalStop('GitHub state transport outcome unknown') from None
+
+    def quota_observation(self):
+        """No network request and no invented freshness; last response only."""
+        try:
+            remaining=int(self.rate_limit['x-ratelimit-remaining'])
+            reset=dt.datetime.fromtimestamp(int(self.rate_limit['x-ratelimit-reset']),dt.timezone.utc)
+            if remaining<0 or self.rate_observed_utc is None:raise ValueError()
+            return dict(remaining=remaining,reset_utc=reset.isoformat(),observed_utc=self.rate_observed_utc)
+        except (KeyError,TypeError,ValueError,OverflowError,OSError):
+            raise GlobalStop('Git quota headers unavailable') from None
 
     def repository(self):return self._call('GET')
     def workflow_run(self,run_id):

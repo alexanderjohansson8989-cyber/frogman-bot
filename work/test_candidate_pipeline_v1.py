@@ -49,6 +49,21 @@ class AssessmentTests(unittest.TestCase):
     def test_incomplete_response_never_rescued(self):
         a=dict(findings=[self.f],selected_urls=['https://example.org/child'])
         with self.assertRaises(Stop):self.call(raw=response('research_quality',a,'max_tokens'))
+    def test_complete_bare_json_has_identical_evidence_checks(self):
+        a=dict(findings=[self.f],selected_urls=['https://example.org/child'])
+        r=dict(stop_reason='end_turn',content=[dict(type='text',text=json.dumps(a))])
+        self.assertEqual(self.call(raw=r),self.call())
+        a['findings'][0]=dict(self.f,quote='An invented observation that is absent.')
+        r['content'][0]['text']=json.dumps(a)
+        got=self.call(raw=r)
+        self.assertEqual(got['selected_urls'],['https://example.org/child'])
+        self.assertEqual(got['ledger']['findings'],[])
+    def test_bare_json_never_repairs_truncation_prose_or_duplicates(self):
+        good=json.dumps(dict(findings=[],selected_urls=[]))
+        for text,stop in [(good,'max_tokens'),(good[:-1],'end_turn'),('Here is the result: '+good,'end_turn'),
+                          (good+good,'end_turn'),('{"findings":[],"findings":[],"selected_urls":[]}','end_turn')]:
+            with self.subTest(text=text,stop=stop),self.assertRaises(Stop):
+                self.call(raw=dict(stop_reason=stop,content=[dict(type='text',text=text)]))
     def test_whitespace_binding_has_original_offsets(self):
         b=json.loads(self.req['messages'][0]['content']);b['sources'][0]['spans'][0]['text']=OBS.replace('August ','August\n\t')
         p=copy.deepcopy(self.req);p['messages'][0]['content']=json.dumps(b)
@@ -68,6 +83,12 @@ class PipelineTests(unittest.TestCase):
             return response('compact_review',dict(checks=[dict(fact_index=0,supported=True,evidence=[dict(url='https://example.org/source',quote=OBS)])],unsupported=[],subjective=[]),'max_tokens' if mode=='truncated_review' else 'end_turn')
         def initial(q,urls,searched,dest):return dict(documents=[extract(urls[0],dict(type='text',data=OBS),TIME.isoformat())],failures=[])
         def follow(offered,selected,docs,dest):
+            if mode=='global_source_stop':
+                from operations_ledger_v1 import GlobalStop
+                raise GlobalStop('Expired')
+            if mode=='failed_child':
+                captures.append(selected)
+                return dict(documents=[],failures=[dict(error_type='HTTPError',http_status=403)])
             captures.append(selected);return dict(documents=[extract(selected[0],dict(type='text',data='Another source was read successfully.'),TIME.isoformat())],failures=[])
         with tempfile.TemporaryDirectory() as tmp:
             r=run_question(Q,tmp,request=req,count=lambda p:100,clock=lambda:TIME,save=saved.append,capture_initial=initial,capture_follow=follow,candidates=lambda *args:[dict(url='https://example.org/child')])
@@ -75,13 +96,27 @@ class PipelineTests(unittest.TestCase):
     def test_pipeline_keeps_child_read_despite_bad_finding_and_uses_same_review_text(self):
         r,calls,captures,saved=self.execute()
         self.assertEqual(r['status'],'candidate');self.assertEqual(len(captures),1)
-        self.assertEqual([s for s,p in calls],['search','need','need','forecast','review'])
+        self.assertEqual([s for s,p in calls],['search','need','forecast','review'])
         self.assertTrue(any(s['raw_answer'] and 'review' not in s for s in saved))
         self.assertEqual(json.loads(r['review_request']['messages'][0]['content'])['documents'],profile.audit_documents(r['forecast_request']))
-        self.assertTrue(all(p['output_config']=={'effort':'medium' if stage=='review' else 'high'} for stage,p in calls))
+        self.assertTrue(all(p['output_config']=={'effort':profile.EFFORT[stage]} for stage,p in calls))
+        self.assertIn('Another source was read successfully.',r['forecast_request']['messages'][0]['content'])
+        self.assertEqual(len(r['assessments']),1)
+    def test_failed_child_uses_existing_sources_without_second_need(self):
+        r,calls,captures,_=self.execute('failed_child')
+        self.assertEqual(r['status'],'candidate')
+        self.assertEqual([s for s,p in calls],['search','need','forecast','review'])
+        self.assertEqual(len(r['documents']),1)
+        self.assertEqual(r['child_capture']['failures'][0]['http_status'],403)
+    def test_source_global_stop_prevents_forecast_and_review(self):
+        r,calls,_,_=self.execute('global_source_stop')
+        self.assertEqual(r['status'],'global_stop')
+        self.assertEqual([s for s,p in calls],['search','need'])
     def test_review_cutoff_stays_error_without_another_call(self):
         r,calls,_,_=self.execute('truncated_review')
-        self.assertEqual(r['status'],'review_error');self.assertIsNotNone(r['raw_answer'])
+        self.assertEqual(r['status'],'candidate');self.assertIsNotNone(r['raw_answer'])
+        self.assertEqual(r['review']['decision'],'unavailable')
+        self.assertEqual(r['review']['labels'],['review_unavailable'])
         self.assertEqual(sum(stage=='review' for stage,p in calls),1)
     def test_zero_category_policy_does_not_modify_original(self):
         a=dict(decision='forecast',distribution=dict(kind='categorical',probabilities={'0':1,'1':0}))

@@ -93,13 +93,15 @@ def fitted_request(q,docs,time,journal,*,model=OPUS,needs=None,gaps=None):
     raise Stop('Arm excerpts exceed input limit')
 
 def candidates(q,needs,docs,folder):
-    found=[];seen={d['url'] for d in docs}
+    from research_quality import known_urls
+    from research_terms_v1 import words
+    found=[];seen=known_urls(docs)
     for d in docs:
         if d.get('network_media_type')!='text/html':continue
         for c in linked_candidates(d,(Path(folder)/d['archive_name']).read_bytes()):
             if c['url'] not in seen:found.append(c);seen.add(c['url'])
-    terms=set(re.findall(r'[a-z0-9]{3,}',json.dumps([q,needs]).lower()))
-    return sorted(found,key=lambda c:-len(terms&set(re.findall(r'[a-z0-9]{3,}',c['url'].lower()))))[:30]
+    terms=words(json.dumps([q,needs]))
+    return sorted(found,key=lambda c:-len(terms&words(c['url'])))[:30]
 
 def run(catalog,window,folder,*,call,clock,save,capture_initial,capture_follow,budget=Decimal('54')):
     validate(catalog,window)

@@ -8,8 +8,9 @@ import json
 import re
 from bounded_evidence import MAX_SENT_CHARS, excerpt
 from independent_runner import Stop
+from research_terms_v1 import words as tokens
 
-VERSION = 'context-data-windows-1'
+VERSION = 'context-data-windows-2'
 STOP = set('will what when where which before after with from that this have been than there their question resolution source criteria scoring deadline expected original first latest http https www html true false null com org'.split())
 MONTH = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
 
@@ -18,13 +19,13 @@ def _terms(question, needs):
     # Exclude URL/scoring boilerplate from lexical relevance.
     value = [question.get('question',''), question.get('unit',''),
              [n.get('description','') for n in needs]]
-    return set(re.findall(r'[a-z]{4,}',json.dumps(value).lower())) - STOP
+    return tokens(json.dumps(value)) - STOP
 
 
 def _score(text, terms):
     lines = [' '.join(x.split()) for x in text.splitlines() if x.strip()]
     normalized = ' '.join(lines)
-    words=set(re.findall(r'[a-z]{4,}',normalized.lower()))
+    words=tokens(normalized)
     overlap = len(words & terms)
     numeric = sum(bool(re.search(r'(?<!\w)-?\d+(?:[.,]\d+)?',x)) for x in lines)
     # Navigation is usually lexical but has few measurements or full sentences.
@@ -32,7 +33,7 @@ def _score(text, terms):
     dates = min(2,len(re.findall(MONTH+r'\s+\d{1,2}(?:[–—-]\d{1,2})?,?\s+20\d\d',normalized,re.I)))
     schedule = bool(re.search(r'(?:next|scheduled|would be held|will be held).{0,100}(?:meeting|'+MONTH+r')',normalized,re.I))
     table = bool(re.search(r'(?:seasonally adjusted|observed monthly|in thousands|weekly claims|sunspot number)',normalized,re.I))
-    heading_words=set(re.findall(r'[a-z]{4,}',normalized[:500].lower()))
+    heading_words=tokens(normalized[:500])
     return overlap*2 + len(heading_words & terms)*2 + data + dates*2 + schedule*12 + (4 if table and numeric>=5 else 0)
 
 

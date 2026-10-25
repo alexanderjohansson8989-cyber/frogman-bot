@@ -199,15 +199,18 @@ def select_excerpt(document, question, char_limit):
     if type(char_limit) is not int or not 1 <= char_limit <= MAX_SENT_CHARS:
         raise Stop('Invalid excerpt limit')
     stopwords = set('will what when where which before after with from that this have been than there their question resolution source http https www html true false null com org'.split())
-    terms = {t for t in re.findall(r'[a-z]{4,}', json.dumps(question).lower())
+    from research_terms_v1 import words as tokens
+    terms = {t for t in tokens(json.dumps(question))
              if t not in stopwords}
     chunks = []
+    size=min(3500,max(1,char_limit//3))
+    context=min(250,char_limit//12)
     for page in document['pages']:
         text = page['text']
-        for start in range(0,len(text),3500):
-            lo=max(0,start-250);hi=min(len(text),start+3750)
+        for start in range(0,len(text),size):
+            lo=max(0,start-context);hi=min(len(text),start+size+context)
             content=text[lo:hi]
-            words=set(re.findall(r'[a-z]{4,}',content.lower()))
+            words=tokens(content)
             chunks.append(dict(page=page['page'],start=lo,end=hi,text=content,
                                score=len(words & terms)))
     if not chunks:raise Stop('No source chunks')

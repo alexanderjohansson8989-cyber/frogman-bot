@@ -7,8 +7,9 @@ import copy,json,re
 from bounded_evidence import digest
 from evidence_quote_spans import locate
 from independent_runner import Stop,strict_json
+from need_gap_classification_v1 import CONTRACT as GAP_CONTRACT,classify
 
-VERSION='research-assessment-v1'
+VERSION='research-assessment-v2'
 FIELDS={'need_id','source_sha256','quote','kind','series','unit','period','target_relevance','vintage_status'}
 
 def parse(reply,request):
@@ -18,9 +19,18 @@ def parse(reply,request):
     ids={n['id'] for n in needs}
     text='\n'.join(b.get('text','') for b in reply.get('content',[]) if b.get('type')=='text')
     hits=re.findall(r'<research_quality>\s*(.*?)\s*</research_quality>',text,re.S)
-    if len(hits)!=1:raise Stop('Research quality assessment missing')
-    a=strict_json(hits[0])
-    if not isinstance(a,dict) or set(a)!={'findings','selected_urls'}:raise Stop('Assessment envelope')
+    try:
+        if len(hits)==1:
+            a=strict_json(hits[0])
+        elif not hits and text.strip().startswith('{') and text.strip().endswith('}'):
+            # Complete bare JSON is the same envelope, not a repair of truncation.
+            # All field, URL and exact-source checks below still apply.
+            a=strict_json(text.strip())
+        else:raise Stop('Research quality assessment missing')
+    except ValueError as exc:raise Stop('Invalid research assessment JSON') from exc
+    gap_contract=body.get('assessment_contract')==GAP_CONTRACT
+    envelopes=({'findings','selected_urls'},{'findings','selected_urls','missing_needs'}) if gap_contract else ({'findings','selected_urls'},)
+    if not isinstance(a,dict) or set(a) not in envelopes:raise Stop('Assessment envelope')
     if not isinstance(a['findings'],list) or len(a['findings'])>15:raise Stop('Bounded finding list required')
     selected=a['selected_urls'];diagnostics=[]
     allowed={c['url'] for c in body['candidates']}
@@ -61,5 +71,9 @@ def parse(reply,request):
         findings=findings,covered_observation_need_ids=sorted(covered),
         required_observation_needs_missing=[n['id'] for n in needs if n['required'] and n['id'] not in covered],
         semantic_review_pending=True,publication=False)
-    return dict(version=VERSION,request_sha256=digest(request),selected_urls=copy.deepcopy(selected),
+    if gap_contract:
+        labels,issues=classify(a.get('missing_needs'),ledger['required_observation_needs_missing'],ids)
+        ledger.update(version=GAP_CONTRACT,missing_need_classifications=labels)
+        diagnostics.extend(issues)
+    return dict(version=GAP_CONTRACT if gap_contract else VERSION,request_sha256=digest(request),selected_urls=copy.deepcopy(selected),
                 ledger=ledger,diagnostics=diagnostics)

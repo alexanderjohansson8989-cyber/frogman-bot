@@ -44,7 +44,7 @@ class IntegrityTests(unittest.TestCase):
                 ledger.dispatch = slow_dispatch
                 req = ReservedRequester(ledger, 'q', transport=calls.append, count=lambda p:100, guard=guard)
                 p = dict(model=OPUS, system='Test', messages=[dict(role='user', content='Source')],
-                         max_tokens=OUT['need'], output_config={'effort':'high'})
+                         max_tokens=OUT['need'], output_config={'effort':'medium'})
                 with self.assertRaises(GlobalStop):
                     req('need', p)
                 self.assertEqual(calls, [])

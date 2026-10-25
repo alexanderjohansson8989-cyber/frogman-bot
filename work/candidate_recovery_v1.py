@@ -21,7 +21,7 @@ def inspect(store):
 
 class RecoveryHost:
     def __init__(self,store,owner,folder,*,get_run,clock):
-        self.store,self.owner=store,owner;self.closed=False
+        self.store,self.owner,self.clock=store,owner,clock;self.closed=False
         _,files=store.load();inspect_database(files['journal.sqlite3'],store)
         old=store.manifest['owner']
         if old is None:raise GlobalStop('No interrupted owner to recover')
@@ -36,7 +36,7 @@ class RecoveryHost:
 
     def settle_saved(self):
         """Only already persisted matching raw responses can release a reserve."""
-        from prospective_runner_4 import cost
+        from candidate_cost_v1 import cost
         from advisor_policy import OPUS,RATES
         from candidate_profile_v1 import OUT
         from decimal import Decimal
@@ -48,21 +48,88 @@ class RecoveryHost:
             except Exception:unknown.append(key);continue
             # Ledger validates identical saved receipt hash and commits overrun
             # before stopping. This cannot manufacture or replace a raw answer.
-            self.ledger.settle(key,amount,raw)
-            if kind!='search':
-                a,b=RATES[OPUS]
-                counted_reserve=(Decimal(reserved)-Decimal(OUT[kind])*b)/a
-                if counted_reserve<1 or counted_reserve!=counted_reserve.to_integral_value() or raw['usage']['input_tokens']>counted_reserve:
+            with self.ledger.checkpoint_batch():
+                self.ledger.settle(key,amount,raw)
+                if raw['usage']['output_tokens']>OUT[kind]:
                     with self.ledger.tx():self.ledger.db.execute('UPDATE policy SET stopped=1')
-                    raise GlobalStop('Recovered input exceeded preflight reserve; persistent stop')
+                    raise GlobalStop('Recovered output exceeded candidate request limit; persistent stop')
+                if kind!='search':
+                    a,b=RATES[OPUS]
+                    counted_reserve=(Decimal(reserved)-Decimal(OUT[kind])*b)/a
+                    if counted_reserve<1 or counted_reserve!=counted_reserve.to_integral_value() or raw['usage']['input_tokens']>counted_reserve:
+                        with self.ledger.tx():self.ledger.db.execute('UPDATE policy SET stopped=1')
+                        raise GlobalStop('Recovered input exceeded preflight reserve; persistent stop')
             settled.append(key)
         return dict(settled=settled,unknown=unknown)
+
+    def cancel_proven_unsent(self):
+        """Release only attested operations that never consumed a POST permit.
+
+        The owning workflow must already be terminal (constructor check).
+        Missing contracts, consumed permits or any receipt remain uncertain.
+        No claim about zero provider cost is made for an unproven operation.
+        """
+        from candidate_dispatch_v1 import MODEL_CONTRACT
+        self.store.assert_owner(self.owner)
+        db=self.ledger.db;cancelled=[];unknown=[]
+        tables={x[0] for x in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        rows=db.execute("SELECT key,kind,payload_sha,raw,actual,receipt_sha FROM operations WHERE state='uncertain' ORDER BY key").fetchall()
+        for key,kind,payload_sha,raw,actual,receipt_sha in rows:
+            contract=db.execute('SELECT payload_sha256,protocol FROM model_dispatch_contracts WHERE key=?',(key,)).fetchone() if 'model_dispatch_contracts' in tables else None
+            permit=db.execute('SELECT 1 FROM effect_permits WHERE key=?',('model/'+key,)).fetchone() if 'effect_permits' in tables else None
+            if (kind not in ('search','need','forecast','review') or raw is not None or actual is not None
+                    or receipt_sha is not None or contract!=(payload_sha,MODEL_CONTRACT) or permit is not None):
+                unknown.append(key);continue
+            self.ledger.detail=('recovery-proven-unsent',dict(key=key,protocol=MODEL_CONTRACT,payload_sha256=payload_sha,
+                reason='Completed owning workflow; attested fixed client; no consumed model permit'))
+            try:
+                with self.ledger.tx():
+                    db.execute("UPDATE operations SET state='cancelled_unsent' WHERE key=? AND state='uncertain'",(key,))
+            finally:self.ledger.detail=None
+            cancelled.append(key)
+        return dict(cancelled_unsent=cancelled,unknown=unknown)
+
+    def cancel_proven_unsent_submissions(self):
+        """Cancel only pre-attested submissions with no possible HTTP entry.
+
+        Constructor already proves the previous owning workflow terminal.
+        A consumed permit, receipt, missing contract or changed plan stays
+        uncertain. No server read is used to infer that a write never happened.
+        """
+        from candidate_dispatch_v1 import SUBMISSION_CONTRACT
+        from competition_adapter_v1 import VERSION as FORECAST_VERSION
+        from candidate_comments_v1 import VERSION as COMMENT_VERSION
+        self.store.assert_owner(self.owner)
+        db=self.ledger.db;cancelled=[];unknown=[]
+        tables={x[0] for x in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        rows=db.execute("SELECT key,plan_sha,plan,receipt FROM submissions WHERE state='uncertain' ORDER BY key").fetchall()
+        for key,plan_sha,text,receipt in rows:
+            contract=db.execute('SELECT kind,plan_sha256,payload_sha256,protocol FROM submission_dispatch_contracts WHERE key=?',(key,)).fetchone() if 'submission_dispatch_contracts' in tables else None
+            # Neither kind may have consumed a permit, even in a damaged row.
+            permit=db.execute('SELECT 1 FROM effect_permits WHERE key IN (?,?)',('forecast/'+key,'comment/'+key)).fetchone() if 'effect_permits' in tables else None
+            try:
+                plan=json.loads(text)
+                kind={FORECAST_VERSION:'forecast',COMMENT_VERSION:'comment'}.get(plan.get('version'))
+                expected=(kind,plan_sha,digest(plan['payload']),SUBMISSION_CONTRACT)
+                valid=kind is not None and digest(plan)==plan_sha and contract==expected
+            except (ValueError,TypeError,KeyError,AttributeError):valid=False
+            if not valid or receipt is not None or permit is not None:
+                unknown.append(key);continue
+            self.ledger.detail=('recovery-proven-unsent-submission',dict(key=key,kind=kind,
+                plan_sha256=plan_sha,payload_sha256=contract[2],protocol=SUBMISSION_CONTRACT,
+                reason='Completed owner; pre-attested fixed client; no consumed submission permit'))
+            try:
+                with self.ledger.tx():
+                    db.execute("UPDATE submissions SET state='cancelled_unsent' WHERE key=? AND state='uncertain'",(key,))
+            finally:self.ledger.detail=None
+            cancelled.append(key)
+        return dict(cancelled_unsent=cancelled,unknown=unknown)
 
     def readback_forecasts(self,fetch):
         self.store.assert_owner(self.owner);verified=[];unknown=[]
         for key,plan in self.ledger.db.execute("SELECT key,plan FROM submissions WHERE state='uncertain'").fetchall():
             if json.loads(plan).get('version')=='candidate-private-comment-v1':continue
-            try:receipt=reconcile(json.loads(plan),self.ledger,fetch=fetch)
+            try:receipt=reconcile(json.loads(plan),self.ledger,fetch=fetch,lifecycle_at=self.clock())
             except Exception as exc:
                 if self.store.poisoned:raise
                 unknown.append(dict(key=key,error_type=type(exc).__name__));continue
@@ -92,7 +159,9 @@ class RecoveryHost:
             raise GlobalStop('Unresolved operation or persistent stop remains')
         # A persisted prepared state proves dispatch was never checkpointed;
         # the transport protocol does not permit sending from this state.
-        self.ledger.detail=('recovery-abandon',dict(reason='Owning workflow completed; no question is retried'))
+        self.ledger.detail=('recovery-abandon',dict(reason='Owning workflow completed; no question is retried',
+            sessions=[x[0] for x in db.execute("SELECT key FROM sessions WHERE status='active' ORDER BY key")],
+            result=dict(status='abandoned_recovered')))
         try:
             with self.ledger.tx():
                 db.execute("UPDATE operations SET state='cancelled_unsent' WHERE state='prepared'")

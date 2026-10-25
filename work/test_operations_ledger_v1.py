@@ -38,7 +38,7 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(GlobalStop):self.l.reserve('two','need',{},'.1')
     def requester(self,transport,count=lambda p:100):
         return ReservedRequester(self.l,'new-q',transport=transport,count=count,guard=lambda:None)
-    def payload(self):return dict(model=OPUS,system='Test',messages=[dict(role='user',content='Public source text')],max_tokens=OUT['need'],output_config={'effort':'high'})
+    def payload(self):return dict(model=OPUS,system='Test',messages=[dict(role='user',content='Public source text')],max_tokens=OUT['need'],output_config={'effort':'medium'})
     def test_transport_timeout_never_retries_and_retains_reservation(self):
         calls=[]
         def fail(p):calls.append(p);raise TimeoutError()
@@ -55,6 +55,13 @@ class LedgerTests(unittest.TestCase):
         raw=dict(model=OPUS,usage=dict(input_tokens=100,output_tokens=100),stop_reason='max_tokens',content=[])
         self.assertEqual(self.requester(lambda p:raw)('need',self.payload()),raw)
         self.assertEqual(self.l.db.execute('SELECT state FROM operations').fetchone()[0],'settled')
+    def test_second_need_refused_before_transport(self):
+        calls=[]
+        raw=dict(model=OPUS,usage=dict(input_tokens=100,output_tokens=100),stop_reason='end_turn',content=[])
+        req=self.requester(lambda p:(calls.append(p),raw)[1])
+        req('need',self.payload())
+        with self.assertRaises(GlobalStop):req('need',self.payload())
+        self.assertEqual(len(calls),1)
     def test_expired_after_count_prevents_dispatch(self):
         calls=[];state=[False]
         def count(p):state[0]=True;return 100

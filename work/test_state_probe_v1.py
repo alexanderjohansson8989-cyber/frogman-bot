@@ -79,6 +79,7 @@ class ProofTests(unittest.TestCase):
             finally:host.close()
         s=store(git);m,files=s.load();self.assertIsNone(m['owner'])
         self.assertTrue(any(n.endswith('.bin') and b==obs.encode() for n,b in files.items()))
-        self.assertTrue(any(n.endswith('.json') and json.loads(b)['action']=='pipeline-result' for n,b in files.items()))
+        from checkpoint_objects_v1 import events_from_snapshot
+        self.assertTrue(any(e['action']=='pipeline-result' for e in events_from_snapshot(files)))
 
 if __name__=='__main__':unittest.main()

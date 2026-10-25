@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import re
+import time
 from operations_ledger_v1 import GlobalStop
 from general_evaluation import instant
 
@@ -83,7 +84,7 @@ class SnapshotStore:
         self.head, self.manifest, self.files = h, manifest, files
         return copy.deepcopy(manifest), dict(files)
 
-    def _read(self, head):
+    def _read(self, head, known_files=None):
         commit = self.git.commit(head)
         if commit.get('sha') != head:
             raise GlobalStop('State commit mismatch')
@@ -134,7 +135,7 @@ class SnapshotStore:
                 raise GlobalStop('State snapshot size limit')
             # Reuse only byte-verified content-addressed local data. A new
             # process still fetches and verifies every manifest member.
-            cached=self.files.get(name)
+            cached=(known_files if known_files is not None else self.files).get(name)
             data=cached if cached is not None and blob_sha(cached)==by_name[name] else self.git.blob(by_name[name])
             if len(data) != description['size'] or sha256(data) != description['sha256'] or blob_sha(data) != by_name[name]:
                 raise GlobalStop('State file checksum mismatch')
@@ -142,9 +143,15 @@ class SnapshotStore:
         validate_files(files)
         return m, files
 
-    def assert_owner(self, owner):
+    def assert_local_owner(self, owner):
+        """Cheap local invariant only; NEVER authorizes an external effect."""
         self.healthy()
-        if self.head is None or self.manifest['owner'] != owner or self.git.head(self.branch) != self.head:
+        if self.head is None or self.manifest['owner'] != owner:
+            raise GlobalStop('State ownership or branch changed')
+
+    def assert_owner(self, owner):
+        self.assert_local_owner(owner)
+        if self.git.head(self.branch) != self.head:
             raise GlobalStop('State ownership or branch changed')
 
     def bootstrap(self, files):
@@ -163,7 +170,8 @@ class SnapshotStore:
         return self._write(self.files, owner)
 
     def checkpoint(self, files, owner):
-        self.assert_owner(owner)
+        # _write checks the remote head and publishes by non-force update.
+        self.assert_local_owner(owner)
         return self._write(files, owner)
 
     def claim_recovery(self, owner, terminal_run):
@@ -214,9 +222,20 @@ class SnapshotStore:
                 else:self.git.update_ref(self.branch,target,force=False)
             except Exception:
                 pass  # Read exactly this target; conflicting/absent state stops.
-            if self.git.head(self.branch) != target:
+            # Git ref reads may briefly return the previous head after PATCH.
+            # Retry GET only, never the write. A competing head stops at once.
+            for delay in (0, .25, .75, 1.5):
+                if delay:time.sleep(delay)
+                observed = self.git.head(self.branch)
+                if observed == target:break
+                if observed != previous:
+                    raise GlobalStop('Competing checkpoint readback')
+            else:
                 raise GlobalStop('State checkpoint not confirmed')
-            got, content = self._read(target)
+            # Newly uploaded bytes are usable only after independently reading
+            # the exact commit/tree/manifest and checking all content identities.
+            # A fresh process has no such cache and downloads every member.
+            got, content = self._read(target, known_files=files)
             if got != m or content != files:
                 raise GlobalStop('State checkpoint readback differs')
             self.head,self.manifest,self.files=target,m,dict(files)

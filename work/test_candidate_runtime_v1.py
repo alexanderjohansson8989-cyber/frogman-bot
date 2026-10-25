@@ -16,7 +16,7 @@ from test_competition_adapter_v1 import NOW,ME,make_plan,post_fixture,with_forec
 
 def terminal(run_id):return dict(id=int(run_id),run_attempt=1,status='completed',repository=dict(full_name=REPO))
 def new_host(git,folder):return DurableHost(store(git),OWNER,folder,clock=lambda:NOW,credit_expires_utc='2026-10-21T00:00:00Z',key_expires_utc='2026-11-06T00:00:00Z')
-def need():return dict(model=OPUS,system='Synthetic',messages=[dict(role='user',content='Source')],max_tokens=OUT['need'],output_config={'effort':'high'})
+def need():return dict(model=OPUS,system='Synthetic',messages=[dict(role='user',content='Source')],max_tokens=OUT['need'],output_config={'effort':'medium'})
 def raw(n=100):return dict(model=OPUS,stop_reason='end_turn',usage=dict(input_tokens=n,output_tokens=100),content=[])
 
 class FakeHTTP:
@@ -157,6 +157,16 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaises(GlobalStop):r.abandon_finished_work()
             finally:r.close()
 
+def serialized_comment_forecast(plan):
+    # Synthetic fixture with ForecastSerializer's field set (not MyForecastSerializer).
+    kind=plan['binding']['question']['api_type']
+    return dict(start_time=(NOW+dt.timedelta(seconds=10)).isoformat(),
+        probability_yes=plan['payload'][0].get('probability_yes'),
+        probability_yes_per_category=copy.deepcopy(plan['expected_forecast_values']) if kind=='multiple_choice' else None,
+        continuous_cdf=copy.deepcopy(plan['expected_forecast_values']) if kind in ('numeric','discrete') else None,
+        quartiles=None,scaling=dict(range_min=None,range_max=None,zero_point=None),
+        options=plan['binding']['question'].get('choices'),question_type=kind,question_unit='')
+
 class CommentClient:
     def __init__(self,plan):self.plan=plan;self.rows=[];self.calls=0;self.timeout=False
     def fetch(self,pid):return ME,with_forecast(post_fixture(),self.plan)
@@ -165,7 +175,7 @@ class CommentClient:
         permit(payload);self.calls+=1
         self.rows.append(dict(id=1,on_post=payload['on_post'],author=ME,is_private=True,is_soft_deleted=False,parent_id=None,
             text=payload['text'],created_at=(NOW+dt.timedelta(seconds=15)).isoformat(),
-            included_forecast=with_forecast(post_fixture(),self.plan)['question']['my_forecasts']['latest']))
+            included_forecast=serialized_comment_forecast(self.plan)))
         if self.timeout:raise TimeoutError()
         return self.rows[-1]
 
@@ -211,7 +221,7 @@ class CommentTests(unittest.TestCase):
             c.create_comment=saved_create
             c.rows=[dict(id=9,on_post=101,author=ME,is_private=True,is_soft_deleted=False,parent_id=None,
                 text=self.plan['comment']['text'],created_at=(NOW+dt.timedelta(seconds=15)).isoformat(),
-                included_forecast=with_forecast(post_fixture(),self.plan)['question']['my_forecasts']['latest'])]
+                included_forecast=serialized_comment_forecast(self.plan))]
             r=RecoveryHost(store(self.git),OTHER,Path(tmp)/'recovery',get_run=terminal,clock=lambda:NOW)
             try:
                 result=r.readback_comments(c)

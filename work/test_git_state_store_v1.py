@@ -5,6 +5,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from operations_ledger_v1 import Ledger,GlobalStop,ReservedRequester
 from git_state_store_v1 import SnapshotStore,canonical,blob_sha,owner_id,sha256
@@ -12,6 +13,7 @@ from durable_candidate_host_v1 import DurableHost,database_bytes,inspect_databas
 from test_competition_adapter_v1 import NOW,ME,post_fixture,bind_post,make_plan,with_forecast
 from competition_adapter_v1 import submit_once
 from candidate_profile_v1 import OUT
+from checkpoint_objects_v1 import events_from_snapshot
 from advisor_policy import OPUS
 
 REPO='alexanderjohansson8989-cyber/metaculus-bot'
@@ -82,6 +84,25 @@ class StateTests(unittest.TestCase):
         self.git.fail='after';self.store.claim(OWNER)
         self.assertEqual(self.store.manifest['owner'],OWNER)
         self.assertFalse(self.store.poisoned)
+    def test_delayed_readback_retries_only_reads(self):
+        old=self.store.head;original=self.git.head;update=self.git.update_ref;stale=[]
+        def write(*args,**kwargs):
+            update(*args,**kwargs);stale.extend([old,old])
+        self.git.update_ref=write
+        self.git.head=lambda b:stale.pop(0) if stale else original(b)
+        with patch('git_state_store_v1.time.sleep') as sleep:self.store.claim(OWNER)
+        self.assertEqual(len(self.git.updated),1);self.assertEqual(sleep.call_count,2)
+        self.assertEqual(self.store.head,original(BRANCH))
+    def test_persistent_old_readback_stops_after_four_gets(self):
+        old=self.store.head;original=self.git.head;update=self.git.update_ref;reads=[]
+        def write(*args,**kwargs):
+            update(*args,**kwargs)
+            def stale(b):reads.append(b);return old
+            self.git.head=stale
+        self.git.update_ref=write
+        with patch('git_state_store_v1.time.sleep'),self.assertRaises(GlobalStop):self.store.claim(OWNER)
+        self.assertEqual(len(reads),4);self.assertEqual(len(self.git.updated),1)
+        self.assertTrue(self.store.poisoned);self.assertNotEqual(original(BRANCH),old)
     def test_lost_unsuccessful_ack_stops_without_rebasing_or_stealing(self):
         old=self.store.head;self.git.fail='before'
         with self.assertRaises(GlobalStop):self.store.claim(OWNER)
@@ -117,7 +138,7 @@ class StateTests(unittest.TestCase):
             finally:next_host.close()
     def request(self,host,transport):
         req=ReservedRequester(host.ledger,'q',transport=host.model_transport(transport),count=lambda p:100,guard=host.before_effect)
-        p=dict(model=OPUS,system='Synthetic',messages=[dict(role='user',content='Synthetic source text')],max_tokens=OUT['need'],output_config={'effort':'high'})
+        p=dict(model=OPUS,system='Synthetic',messages=[dict(role='user',content='Synthetic source text')],max_tokens=OUT['need'],output_config={'effort':'medium'})
         return req,p
     def test_uncertain_dispatch_and_full_request_exist_before_transport(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,7 +146,7 @@ class StateTests(unittest.TestCase):
             def transport(payload):
                 m,files=store(self.git).load();inspection=inspect_database(files['journal.sqlite3'],self.store)
                 self.assertTrue(inspection['blocked'])
-                archives=[json.loads(x) for n,x in files.items() if n.endswith('.json')]
+                archives=events_from_snapshot(files)
                 request=[x for x in archives if x['action']=='operation-request'][0]
                 self.assertEqual(request['arguments'][2],payload)
                 self.assertEqual(m['owner'],OWNER);calls.append(payload);raise TimeoutError()

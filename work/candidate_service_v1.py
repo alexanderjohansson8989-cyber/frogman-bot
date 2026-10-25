@@ -9,17 +9,18 @@ from advisor_policy import OPUS,RATES
 from bounded_evidence import digest
 from general_evaluation import instant
 from candidate_pipeline_v1 import run_question
-from candidate_profile_v1 import OUT
+from candidate_profile_v1 import OUT,STAGE_LIMITS
 from competition_adapter_v1 import prepare
 from operations_ledger_v1 import ReservedRequester,GlobalStop
 from independent_runner import Stop
+from outcome_metrics_v1 import question_metrics
 
 VERSION='candidate-service-v1-dry-run'
 def whole_question_reserve():
     a,b=RATES[OPUS]
-    return Decimal('1.20')+sum((Decimal(36000)*a+Decimal(OUT[k])*b)*n/1000000 for k,n in [('need',2),('forecast',1),('review',1)])
+    return Decimal('1.20')+sum((Decimal(36000)*a+Decimal(OUT[k])*b)*STAGE_LIMITS[k]/1000000 for k in ('need','forecast','review'))
 
-def run_bound_question(binding,folder,ledger,*,transport,count,clock,save,capture_initial,capture_follow,candidates,guard_host=lambda:None):
+def run_bound_question(binding,folder,ledger,*,transport,count,clock,save,capture_initial,capture_follow,candidates,guard_host=lambda:None,publish=False):
     b=copy.deepcopy(binding);start=clock();cutoff=min(instant(b['cutoff_utc']),start+dt.timedelta(hours=1))
     def guard():
         guard_host()
@@ -30,10 +31,12 @@ def run_bound_question(binding,folder,ledger,*,transport,count,clock,save,captur
     result=run_question(b['question'],folder,request=requester,count=count,clock=clock,save=save,
         capture_initial=capture_initial,capture_follow=capture_follow,candidates=candidates,guard=guard)
     result['service_version']=VERSION;result['binding_sha256']=digest(b)
-    if result['status']=='global_stop':save(copy.deepcopy(result));return result
+    if result['status']=='global_stop':
+        result['outcome_metrics']=question_metrics(result);save(copy.deepcopy(result));return result
     if result['status']=='candidate':
         try:result['submission_plan']=prepare(b,result);result['status']='prepared_local_only'
         except (Stop,ValueError) as exc:
             result['status']='preparation_stop';result['diagnostics'].append(dict(stage='prepare',error_type=type(exc).__name__,reason=str(exc)[:160]))
-    save(copy.deepcopy(result));ledger.finish_session(key,result)
+    result['outcome_metrics']=question_metrics(result)
+    save(copy.deepcopy(result));ledger.finish_session(key,result,publish)
     return result

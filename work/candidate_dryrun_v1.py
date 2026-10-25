@@ -1,4 +1,5 @@
 """One frozen live question through the durable host, WITHOUT submission."""
+from independent_runner import NoRedirect as SourceNoRedirect
 import datetime as dt,json,os,secrets
 from decimal import Decimal
 from pathlib import Path
@@ -55,7 +56,7 @@ def run(p,git,mc,claude,folder,*,run_id,attempt,code_sha256,clock,capture_initia
         # Guard every individual source HTTP read, not only the capture batch.
         import urllib.request
         from candidate_api_v1 import NoRedirect
-        opener=urllib.request.build_opener(NoRedirect())
+        opener=urllib.request.build_opener(SourceNoRedirect())
         def source_open(req,**kwargs):host.before_effect();return opener.open(req,**kwargs)
         def initial_capture(q,urls,searched,d):return capture_selected(q,urls,searched,d,open_request=source_open)
         def child_capture(offered,selected,docs,d):return capture_children(offered,selected,docs,d,open_request=source_open)

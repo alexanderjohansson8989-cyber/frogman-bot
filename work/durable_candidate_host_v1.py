@@ -32,8 +32,8 @@ def inspect_database(data,store):
         # Reading the required tables also rejects a missing/incompatible schema.
         counts={name:db.execute('SELECT COUNT(*) FROM '+name).fetchone()[0]
                 for name in ('operations','submissions','sessions')}
-        blocked=(policy[2] or db.execute("SELECT COUNT(*) FROM operations WHERE state='uncertain'").fetchone()[0]
-                 or db.execute("SELECT COUNT(*) FROM submissions WHERE state='uncertain'").fetchone()[0]
+        blocked=(policy[2] or db.execute("SELECT COUNT(*) FROM operations WHERE state IN ('prepared','uncertain')").fetchone()[0]
+                 or db.execute("SELECT COUNT(*) FROM submissions WHERE state IN ('prepared','uncertain')").fetchone()[0]
                  or db.execute("SELECT COUNT(*) FROM sessions WHERE status='active'").fetchone()[0])
         return dict(blocked=bool(blocked),counts=counts)
     except (sqlite3.Error,ValueError) as exc:raise GlobalStop('Unreadable SQLite snapshot') from exc
@@ -49,11 +49,14 @@ class CheckpointLedger(Ledger):
     def __init__(self,path,store,owner,clock):
         self.ready=False;self.store=store;self.owner=copy.deepcopy(owner);self.clock=clock
         self.archive={n:b for n,b in store.files.items() if n!='journal.sqlite3'}
-        self.detail=None
+        self.detail=None;self.batch_depth=0;self.batch_dirty=False
+        self.staging=False;self.pending=False
         try:
             super().__init__(path,cap_usd=str(Decimal(store.cap)/1000000),period_key=store.period)
             self.db.execute('''CREATE TABLE IF NOT EXISTS checkpoint_events
                 (sequence INTEGER PRIMARY KEY,created_utc TEXT NOT NULL,action TEXT NOT NULL,archive_sha256 TEXT NOT NULL)''')
+            from checkpoint_objects_v1 import initialize
+            initialize(self.db)
             self.ready=True
             self.record('host-open',{})
         except BaseException:
@@ -61,31 +64,66 @@ class CheckpointLedger(Ledger):
             raise
 
     def guard(self):
-        if self.ready:self.store.assert_owner(self.owner)
+        if self.ready:self.store.assert_local_owner(self.owner)
         super().guard()
 
     @contextlib.contextmanager
+    def checkpoint_batch(self):
+        """One remote checkpoint for local transitions; NEVER wrap external I/O.
+
+        Commit even on an exception: saved receipts and persistent stops must
+        survive. The next external effect still needs a fresh ownership check.
+        """
+        if self.batch_depth:raise GlobalStop('Nested checkpoint batch forbidden')
+        self.store.assert_local_owner(self.owner)
+        self.batch_depth=1;self.batch_dirty=False
+        try:yield
+        finally:
+            self.batch_depth=0
+            if self.batch_dirty:self.checkpoint()
+
+    @contextlib.contextmanager
     def tx(self):
-        if self.ready:self.store.assert_owner(self.owner)
+        if self.ready:self.store.assert_local_owner(self.owner)
         with super().tx():
             yield
             if self.ready:
                 action,arguments=self.detail or ('ledger-update',{})
                 self._event(action,arguments)
-        if self.ready:self.checkpoint()
+        if self.ready:
+            self.pending=True
+            if self.batch_depth:self.batch_dirty=True
+            elif not self.staging:self.checkpoint()
 
     def _event(self,action,arguments):
         now=self.clock().isoformat();instant(now)
         obj=dict(action=action,created_utc=now,arguments=exact_json(arguments))
         raw=canonical(obj);h=sha256(raw)
-        self.archive['a-'+h+'.json']=raw
-        self.db.execute('INSERT INTO checkpoint_events(created_utc,action,archive_sha256) VALUES(?,?,?)',(now,action,h))
+        from checkpoint_objects_v1 import pack
+        root=pack(self.db,obj)
+        cursor=self.db.execute('INSERT INTO checkpoint_events(created_utc,action,archive_sha256) VALUES(?,?,?)',(now,action,h))
+        self.db.execute('INSERT INTO checkpoint_roots VALUES(?,?)',(cursor.lastrowid,root))
 
     def record(self,action,arguments):
         old=self.detail;self.detail=(action,arguments)
         try:
             with self.tx():pass
         finally:self.detail=old
+
+    def stage_diagnostic(self,action,arguments):
+        """Local durable audit only; next effect/accounting checkpoint flushes it.
+
+        A hard process loss may lose these diagnostic-only remote updates.
+        Session/operation/receipt/permit transitions are never deferred here.
+        """
+        if action not in ('pipeline-result','source-capture') or self.staging or self.batch_depth:
+            raise GlobalStop('Only standalone diagnostic events may be staged')
+        self.staging=True
+        try:self.record(action,arguments)
+        finally:self.staging=False
+
+    def flush(self):
+        if self.pending:self.checkpoint()
 
     def invoke(self,action,method,*args):
         old=self.detail;self.detail=(action,args)
@@ -107,6 +145,7 @@ class CheckpointLedger(Ledger):
             files=dict(self.archive,**{'journal.sqlite3':database_bytes(self)})
             validate_files(files)
             self.store.checkpoint(files,self.owner)
+            self.pending=False
         except BaseException as exc:
             self.store.poisoned=True
             if isinstance(exc,GlobalStop):raise
@@ -114,10 +153,12 @@ class CheckpointLedger(Ledger):
 
 
 class DurableHost:
-    def __init__(self,store,owner,folder,*,clock,credit_expires_utc,key_expires_utc):
+    def __init__(self,store,owner,folder,*,clock,credit_expires_utc,key_expires_utc,archive_finished=False):
         self.store,self.owner,self.clock=store,owner,clock
         self.expiry=min(instant(credit_expires_utc),instant(key_expires_utc))
         self.effect_deadline=self.expiry
+        if type(archive_finished) is not bool:raise GlobalStop('Explicit archive mode required')
+        self.archive_finished=archive_finished
         self.closed=False;self.ledger=None
         self.guard_time()
         _,files=store.load()
@@ -139,18 +180,41 @@ class DurableHost:
 
     def before_effect(self):
         if self.closed:raise GlobalStop('Host already closed')
+        if self.ledger is not None and self.ledger.batch_depth:
+            raise GlobalStop('External effect inside uncheckpointed batch forbidden')
+        self.guard_time()
+        if self.ledger is not None:self.ledger.flush()
         self.guard_time();self.store.assert_owner(self.owner)
         # Network ownership checks can themselves cross the deadline.
         self.guard_time()
+
+    def guard_local(self):
+        if self.closed:raise GlobalStop('Host already closed')
+        self.guard_time();self.store.assert_local_owner(self.owner)
+
+    def before_readback(self,deadline):
+        """Bounded receipt reads after a possible write; no new write permit.
+
+        Question cutoff limits dispatch, not reconciliation. Keep the stricter
+        host expiry plus a separate short read window and remote ownership.
+        """
+        def local():
+            if self.closed:raise GlobalStop('Host already closed')
+            if self.clock()>=min(self.expiry,deadline):raise GlobalStop('Readback window expired')
+            if self.ledger.batch_depth:raise GlobalStop('Readback inside checkpoint batch forbidden')
+            self.store.assert_local_owner(self.owner)
+        local();self.ledger.flush();self.store.assert_owner(self.owner);local()
 
     def model_transport(self,transport):
         def call(payload):
             self.before_effect()
             return transport(copy.deepcopy(payload))
+        attest=getattr(transport,'checkpoint_dispatch_contract',None)
+        if attest is not None:call.checkpoint_dispatch_contract=attest
         return call
 
     def save(self,result):
-        self.ledger.record('pipeline-result',result)
+        self.ledger.stage_diagnostic('pipeline-result',result)
 
     def capture(self,callback):
         def call(*args):
@@ -165,28 +229,40 @@ class DurableHost:
                 data=path.read_bytes();h=sha256(data)
                 self.ledger.archive['a-'+h+'.bin']=data
                 names.append(dict(path=path.relative_to(folder).as_posix(),sha256=h,size=len(data)))
-            self.ledger.record('source-capture',dict(files=names,result=result))
+            self.ledger.stage_diagnostic('source-capture',dict(files=names,result=result))
             return result
         return call
 
-    def run(self,binding,*,transport,count,capture_initial,capture_follow,candidates):
+    def run(self,binding,*,transport,count,capture_initial,capture_follow,candidates,publish=False):
         from candidate_service_v1 import run_bound_question
         self.effect_deadline=min(self.expiry,instant(binding['cutoff_utc']),self.clock()+dt.timedelta(hours=1))
         self.before_effect()
-        return run_bound_question(binding,self.folder/'sources',self.ledger,
-            transport=self.model_transport(transport),count=count,clock=self.clock,save=self.save,
+        from bounded_evidence import digest
+        source_folder=self.folder/'sources'/digest(binding)
+        result=run_bound_question(binding,source_folder,self.ledger,
+            transport=self.model_transport(transport),count=self.model_transport(count),clock=self.clock,save=self.save,
             capture_initial=self.capture(capture_initial),capture_follow=self.capture(capture_follow),candidates=candidates,
-            guard_host=self.before_effect)
+            guard_host=self.guard_local,publish=publish)
+        # Also publish terminal diagnostics for global stops when storage still
+        # permits it. Financial transitions were already checkpointed separately.
+        self.ledger.flush()
+        if self.archive_finished and result['status']!='global_stop':
+            from question_archive_v1 import compact_completed
+            compact_completed(self)
+        return result
 
     def close(self):
         if self.closed:return
         self.closed=True
         if self.ledger is None:return
         try:
-            # A completed question can release ownership. Active/uncertain work
-            # must remain fenced, including after cancellation or unknown usage.
+            self.ledger.flush()
+            # Prepared work may outlive its question (e.g. deadline after
+            # submission preparation). Keep an owner for explicit recovery.
             active=self.ledger.db.execute("SELECT COUNT(*) FROM sessions WHERE status='active'").fetchone()[0]
-            if not active:
+            prepared=any(self.ledger.db.execute('SELECT 1 FROM '+table+" WHERE state='prepared'").fetchone()
+                         for table in ('operations','submissions'))
+            if not active and not prepared:
                 self.ledger.guard()
                 self.store.release(self.owner)
         finally:self.ledger.close()

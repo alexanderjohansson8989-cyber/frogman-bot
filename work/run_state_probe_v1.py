@@ -10,6 +10,7 @@ from git_state_store_v1 import SnapshotStore,owner_id,sha256
 from durable_candidate_host_v1 import DurableHost,database_bytes,inspect_database
 from github_git_transport_v1 import GitHubGit
 from operations_ledger_v1 import Ledger,GlobalStop
+from checkpoint_objects_v1 import events_from_snapshot
 
 REPOSITORY='alexanderjohansson8989-cyber/metaculus-bot'
 
@@ -45,7 +46,7 @@ def run_probe(phase,git,folder,*,run_id,attempt,code_sha256,clock,expected_head=
                 raise GlobalStop('Synthetic operation did not survive job boundary')
             if ledger.db.execute('SELECT key,status FROM sessions').fetchall()!=[('synthetic-question','complete')]:
                 raise GlobalStop('Synthetic session did not survive job boundary')
-            archives=[json.loads(b) for n,b in s.files.items() if n.endswith('.json')]
+            archives=events_from_snapshot(s.files)
             if not any(x['action']=='operation-request' and x['arguments'][2].get('synthetic') is True for x in archives):
                 raise GlobalStop('Full synthetic request not restored')
     finally:host.close()

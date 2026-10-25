@@ -4,6 +4,7 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 from bounded_evidence import digest
 from independent_runner import Stop
+from operations_ledger_v1 import GlobalStop
 
 
 class Links(HTMLParser):
@@ -16,18 +17,35 @@ class Links(HTMLParser):
                 if key == 'href' and value:
                     self.links.append(value)
 
+def known_urls(documents):
+    """Exact known aliases, without collapsing semantically different URLs."""
+    urls=set()
+    for d in documents:
+        values=[d.get('url'),d.get('network_final_url')]
+        chain=d.get('network_redirects',[])
+        if isinstance(chain,list):
+            for hop in chain:
+                if isinstance(hop,dict):values.extend([hop.get('source'),hop.get('target')])
+        for value in values:
+            if isinstance(value,str) and value.startswith('https://'):urls.add(value)
+    return urls
 
 def linked_candidates(document, raw_bytes):
     if (document.get('network_media_type') != 'text/html' or
             digest(raw_bytes) != document.get('network_original_sha256')):
         raise Stop('Original HTML identity required')
     parser = Links(); parser.feed(raw_bytes.decode('utf-8-sig'))
-    result = []; seen = set()
+    result = []; seen = known_urls([document])
     for href in parser.links:
-        url = urljoin(document['url'], href)
-        parsed = urlsplit(url)
-        if (parsed.scheme != 'https' or not parsed.hostname or parsed.fragment or
-                parsed.username or parsed.password or parsed.port not in (None, 443)):
+        try:
+            url = urljoin(document.get('network_final_url',document['url']), href)
+            parsed = urlsplit(url)
+            if (parsed.scheme != 'https' or not parsed.hostname or parsed.fragment or
+                    parsed.username or parsed.password or parsed.port not in (None, 443)):
+                continue
+        except ValueError:
+            # A malformed optional href must not discard a readable source or
+            # its other valid links. Original-byte identity is still checked above.
             continue
         if url in seen or url == document['url']:
             continue
@@ -104,15 +122,21 @@ def capture_children(candidates, selected, documents, folder, *, max_reads=2, **
     if any(c not in list(allowed.values()) for c in candidates):
         raise Stop('Child candidate provenance changed')
     offered = {c['url']: c for c in candidates}
-    if any(url not in offered or url in {d['url'] for d in documents} for url in selected):
+    seen=known_urls(documents)
+    if any(url not in offered or url in seen for url in selected):
         raise Stop('Child was not offered or already read')
     result = dict(documents=[], failures=[], source_attempts=0)
     for url in selected:
+        if url in seen:continue
         result['source_attempts'] += 1
         try:
             d = capture(url, folder, **options)
             d['candidate_origin'] = copy.deepcopy(offered[url])
             result['documents'].append(d)
+            seen.update(known_urls([d]))
+        except GlobalStop:
+            raise
         except Exception as exc:
-            result['failures'].append(dict(url=url, error_type=type(exc).__name__))
+            from source_failure_v1 import describe
+            result['failures'].append(dict(url=url, **describe(exc)))
     return result

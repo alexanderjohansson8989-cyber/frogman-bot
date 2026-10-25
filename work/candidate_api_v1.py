@@ -13,6 +13,12 @@ from independent_runner import strict_json
 from operations_ledger_v1 import GlobalStop
 from advisor_policy import OPUS
 
+class TransportNotStarted(GlobalStop):
+    """Local validation/checkpoint failed before opening the network."""
+
+class TransportOutcomeUnknown(GlobalStop):
+    """Transport was entered; this is NOT proof the server received a write."""
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):raise GlobalStop('API redirect forbidden')
 
@@ -21,12 +27,17 @@ class JSONClient:
         self.base,self.headers,self.timeout=base,headers,timeout
         self.opener=opener or urllib.request.build_opener(NoRedirect())
     def call(self,path,*,method='GET',payload=None,permit=None):
-        if method=='POST':
-            if permit is None:raise GlobalStop('Checkpointed one-use permit required')
-            permit(payload)
-        raw=None if payload is None else json.dumps(payload,ensure_ascii=False,allow_nan=False).encode()
-        if raw is not None and len(raw)>2000000:raise GlobalStop('Request byte limit')
-        req=urllib.request.Request(self.base+path,data=raw,headers=self.headers,method=method)
+        try:
+            raw=None if payload is None else json.dumps(payload,ensure_ascii=False,allow_nan=False).encode()
+            if raw is not None and len(raw)>2000000:raise GlobalStop('Request byte limit')
+            req=urllib.request.Request(self.base+path,data=raw,headers=self.headers,method=method)
+            if method=='POST':
+                if permit is None:raise GlobalStop('Checkpointed one-use permit required')
+                permit(payload)
+                from candidate_dispatch_v1 import DispatchPermit
+                if type(permit) is DispatchPermit:permit.mark_http_entered(payload)
+        except GlobalStop as exc:raise TransportNotStarted(str(exc)) from None
+        except Exception:raise TransportNotStarted('API local request preparation failed') from None
         try:
             with self.opener.open(req,timeout=self.timeout) as response:
                 data=response.read(8000001)
@@ -34,15 +45,16 @@ class JSONClient:
                 value=strict_json(data)
                 if not isinstance(value,(dict,list)):raise GlobalStop('API JSON object/list required')
                 return value
-        except urllib.error.HTTPError as exc:raise GlobalStop('API HTTP '+str(exc.code)+'; no retry') from None
-        except GlobalStop:raise
-        except Exception:raise GlobalStop('API transport outcome unknown; no retry') from None
+        except urllib.error.HTTPError as exc:raise TransportOutcomeUnknown('API HTTP '+str(exc.code)+'; no retry') from None
+        except GlobalStop as exc:raise TransportOutcomeUnknown(str(exc)) from None
+        except Exception:raise TransportOutcomeUnknown('API transport outcome unknown; no retry') from None
 
 class ClaudeClient:
-    def __init__(self,key,*,opener=None):
+    def __init__(self,key,*,opener=None,timeout=300):
         if not isinstance(key,str) or not key.strip():raise GlobalStop('Claude credential missing')
+        if type(timeout) is not int or not 1<=timeout<=300:raise GlobalStop('Bounded Claude timeout required')
         self.http=JSONClient('https://api.anthropic.com/v1/',
-            {'x-api-key':key,'anthropic-version':'2023-06-01','Content-Type':'application/json'},opener=opener)
+            {'x-api-key':key,'anthropic-version':'2023-06-01','Content-Type':'application/json'},opener=opener,timeout=timeout)
     def metadata(self):return self.http.call('models/'+OPUS)
     def count(self,payload):
         if payload.get('model')!=OPUS:raise GlobalStop('Unreviewed candidate model')
@@ -86,5 +98,5 @@ class MetaculusClient:
     def comments(self,post_id,actor_id,offset=0):
         self.id(post_id);self.id(actor_id)
         if type(offset) is not int or offset not in (0,25,50):raise GlobalStop('Bounded comment readback')
-        query=urllib.parse.urlencode(dict(post=post_id,author=actor_id,is_private='true',sort='new',limit=25,offset=offset))
+        query=urllib.parse.urlencode(dict(post=post_id,author=actor_id,is_private='true',sort='-created_at',limit=25,offset=offset))
         return self.http.call('comments/?'+query)

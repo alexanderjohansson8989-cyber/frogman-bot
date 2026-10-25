@@ -57,13 +57,15 @@ class AdapterTests(unittest.TestCase):
         p=make_plan(post_fixture('multiple_choice'))
         self.assertEqual(p['expected_forecast_values'],[None,.4,.6])
         self.assertEqual(set(p['payload'][0]['probability_yes_per_category']),{'Active A','Active B'})
-    def test_numeric_uses_provided_grid_and_rejects_concentrated_distribution(self):
+    def test_numeric_uses_provided_grid_and_logs_concentrated_projection(self):
         post=post_fixture('numeric');b=binding(post);p=make_plan(post)
         self.assertEqual(len(p['expected_forecast_values']),201)
         self.assertEqual(p['expected_forecast_values'][0],0);self.assertEqual(p['expected_forecast_values'][-1],1)
         self.assertAlmostEqual(p['expected_forecast_values'][100],.5)
         a=candidate(b,dict(kind='normal_mixture',components=[dict(weight=1,mean=0,sd=.01)],lower_bound=-3,upper_bound=3))
-        with self.assertRaises(ValueError):prepare(b,a)
+        original=copy.deepcopy(a);projected=prepare(b,a)
+        self.assertEqual(a,original);self.assertGreater(projected['format_adaptation']['pmf_l1'],0)
+        self.assertGreater(len(projected['expected_forecast_values']),0)
     def test_readback_checks_author_values_time_and_contract(self):
         p=make_plan();post=with_forecast(post_fixture(),p)
         self.assertTrue(verify_readback(p,post,ME)['verified'])

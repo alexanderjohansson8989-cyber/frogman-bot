@@ -33,6 +33,20 @@ def locate(text,quote,*,limit=256):
         base+=len(segment)+len(BOUNDARY)
     return positions
 
+def claim_positions(original,claim,*,allow_substring=False):
+    """Match a field, or a rationale excerpt, without changing any non-space character."""
+    if not isinstance(original,str) or not isinstance(claim,str) or not original.strip() or not claim.strip():
+        raise Stop('Claim string required')
+    if claim==original:
+        return [dict(start=0,end=len(original),original_quote=original,match='exact')]
+    needle=_fold(claim.strip())[0]
+    if _fold(original.strip())[0]==needle:
+        return [dict(start=0,end=len(original),original_quote=original,match='whitespace_only')]
+    if allow_substring and len(needle)>=15:
+        positions=locate(original,claim)
+        if positions:return positions
+    raise Stop('Review invented or changed claim')
+
 def bind(documents,url,quote):
     positions=[]
     for i,d in enumerate(documents):
