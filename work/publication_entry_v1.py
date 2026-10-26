@@ -43,20 +43,26 @@ def validate_launch(config,*,run_id,attempt,code_sha256,source_commit,workflow_p
 def claim_launch(host,config):
     """Consume the pre-issued nonce durably before models or Metaculus writes.
 
-    Compaction keeps this table. A lost checkpoint is not retried. Another run
-    needs a new explicitly issued launch, even when no question was available.
+    Runs only after recovery is ready and the host is open. A recovery stop
+    before this point leaves the nonce unconsumed; that is not retry authority.
+    Compaction keeps this table. A lost checkpoint is not retried. Once claimed,
+    another run needs a new launch, even when no question was available.
     """
     ledger=host.ledger
-    with ledger.tx():
-        ledger.guard()
-        ledger.db.execute('''CREATE TABLE IF NOT EXISTS publication_launches (
-            nonce TEXT PRIMARY KEY, config_sha TEXT NOT NULL, owner_json TEXT NOT NULL,
-            claimed_utc TEXT NOT NULL)''')
-        nonce=config['launch']['nonce']
-        if ledger.db.execute('SELECT 1 FROM publication_launches WHERE nonce=?',(nonce,)).fetchone():
-            raise GlobalStop('Publication launch already consumed')
-        ledger.db.execute('INSERT INTO publication_launches VALUES(?,?,?,?)',
-            (nonce,digest(config),json.dumps(host.owner,sort_keys=True),host.clock().isoformat()))
+    old=ledger.detail
+    ledger.detail=('publication-launch',dict(nonce=config['launch']['nonce'],config_sha256=digest(config)))
+    try:
+        with ledger.tx():
+            ledger.guard()
+            ledger.db.execute('''CREATE TABLE IF NOT EXISTS publication_launches (
+                nonce TEXT PRIMARY KEY, config_sha TEXT NOT NULL, owner_json TEXT NOT NULL,
+                claimed_utc TEXT NOT NULL)''')
+            nonce=config['launch']['nonce']
+            if ledger.db.execute('SELECT 1 FROM publication_launches WHERE nonce=?',(nonce,)).fetchone():
+                raise GlobalStop('Publication launch already consumed')
+            ledger.db.execute('INSERT INTO publication_launches VALUES(?,?,?,?)',
+                (nonce,digest(config),json.dumps(host.owner,sort_keys=True),host.clock().isoformat()))
+    finally:ledger.detail=old
 
 
 def run(config,folder,*,git,mc,claude,run_id,attempt,code_sha256,clock,

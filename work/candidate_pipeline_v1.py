@@ -15,7 +15,7 @@ from research_assessment_v1 import parse
 import candidate_profile_v1 as profile
 from source_fallback_v1 import capture_with_alternatives
 
-VERSION='frogman-candidate-pipeline-v7-gap-kinds'
+VERSION='frogman-candidate-pipeline-v8-early-probability-limits'
 LIMITS=(12000,8000,5000,3000)
 
 def fit(make,count):
@@ -80,7 +80,7 @@ def run_question(question,folder,*,request,count,clock,save,capture_initial,capt
         if raw.get('stop_reason')!='end_turn':raise Stop('Incomplete forecast')
         answer=text_answer_check(raw,q,p)
         r['raw_answer']=answer;persist()
-        profile.check_distribution(answer)
+        profile.check_distribution(answer,q)
         if answer['decision']=='abstain':r['status']='abstain';persist();return r
         rp=profile.review_payload(q,answer,profile.audit_documents(p));r['review_request']=rp;persist()
         try:

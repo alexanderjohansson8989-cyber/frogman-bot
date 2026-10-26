@@ -1,7 +1,7 @@
-# Frogman-bot – development candidate, 25 October 2026
+# Frogman-bot – development candidate, 26 October 2026
 
-Readable code corresponding to private offline CI run 40205355011, commit
-5e53ce6bf62a40a08a5dd05784fbf4402d4e9cfb. Production source bytes are unchanged.
+Readable code corresponding to locally tested bundle dc4f3d757fd543e9734920f17a555d37c617364e7e2bd2af4f2b883ad95eef4f.
+Production source bytes are unchanged. SOURCE_MANIFEST records separate remote CI evidence when available; null means not verified.
 This is not an activated competition deployment or a claim of winning accuracy.
 
 ## Pipeline
@@ -36,6 +36,12 @@ returned service/queue snapshot, not season coverage or accuracy.
 - `work/production_cycle_v1.py` and `publication_intent_v1.py`: queue and recovery.
 - `work/outcome_metrics_v1.py` and `numeric_diagnostics_v1.py`: passive diagnostics.
 
+The current update validates explicit probability bounds before factual review,
+keeps long source URLs in evidence while omitting them with a hash note in the
+short comment, and includes cleaned criteria text in excerpt relevance terms.
+Publication nonce consumption has a named audit event in the same transaction.
+Recovery may stop before nonce consumption; this is not permission to retry.
+
 No active workflow, credentials, launch configuration or state database ships.
 Account/repository identifiers and historical test-driver identifiers are code
 constants, not tokens. Historical helper entry points remain for inspection and
@@ -49,7 +55,7 @@ Run `python run_tests.py` with Python 3.12+. The runner blocks network connectio
 uses a local temporary directory and needs no credentials. Its manifest lists
 the suite. Private historical source/acceptance fixture tests are explicitly
 skipped; synthetic numeric fixtures replace historical data. This public-package
-test result is distinct from private CI's 415 passing tests plus one skip.
+test result is distinct from the private local package: 423 passing tests plus one skip.
 No external dependency sources are bundled. PDF capture optionally requires
 `pdfplumber`, not needed for these tests. No distribution license is selected.
 

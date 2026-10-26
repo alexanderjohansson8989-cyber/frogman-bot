@@ -6,19 +6,28 @@ evidence that a page is correct or that missing facts do not exist.
 import copy
 import json
 import re
+import html
 from bounded_evidence import MAX_SENT_CHARS, excerpt
 from independent_runner import Stop
 from research_terms_v1 import words as tokens
 
-VERSION = 'context-data-windows-2'
+VERSION = 'context-data-windows-3-criteria'
 STOP = set('will what when where which before after with from that this have been than there their question resolution source criteria scoring deadline expected original first latest http https www html true false null com org'.split())
 MONTH = r'(?:January|February|March|April|May|June|July|August|September|October|November|December)'
 
 
 def _terms(question, needs):
-    # Exclude URL/scoring boilerplate from lexical relevance.
+    # Criteria are retrieval hints, not evidence. Strip markup and URLs while
+    # retaining visible series/definition text; never ingest scoring metadata.
+    criteria=[]
+    for key in ('criteria','fine_print'):
+        text=question.get(key) or ''
+        if not isinstance(text,str):continue
+        text=html.unescape(text)
+        text=re.sub(r'<[^>]*>',' ',text)
+        criteria.append(re.sub(r'https?://[^\s<>\x22\x27)]+',' ',text,flags=re.I))
     value = [question.get('question',''), question.get('unit',''),
-             [n.get('description','') for n in needs]]
+             criteria,[n.get('description','') for n in needs]]
     return tokens(json.dumps(value)) - STOP
 
 

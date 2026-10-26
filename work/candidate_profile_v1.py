@@ -10,7 +10,7 @@ from research_enrichment import SYSTEM as NEED_SYSTEM
 from numeric_diagnostics_v1 import raw_quantiles
 from need_gap_classification_v1 import CONTRACT as GAP_CONTRACT,RULES as GAP_RULES
 
-VERSION='frogman-candidate-profile-v8-gap-kinds'
+VERSION='frogman-candidate-profile-v9-early-probability-limits'
 STAGE_LIMITS={'search':1,'need':1,'forecast':1,'review':1}
 OUT={'search':6000,'need':6000,'forecast':6000,'review':4000}
 EFFORT={'search':'high','need':'medium','forecast':'high','review':'medium'}
@@ -76,11 +76,20 @@ def distribution_summary(answer):
     return dict(kind=d['kind'],note='Components are independently truncated before mixing; no untruncated mean asserted. Quantiles describe the raw latent continuous mixture, not final API buckets or discrete outcomes.',
                 raw_numeric_quantiles=raw_quantiles(d))
 
-def check_distribution(answer):
+def check_distribution(answer,question=None):
     if answer['decision']!='forecast':return
     d=answer['distribution']
     if d['kind']=='categorical' and any(not math.isfinite(v) or v<=0 for v in d['probabilities'].values()):
         raise Stop('Unjustified zero categorical outcome')
+    constraints=(question or {}).get('submission_constraints')
+    if d['kind'] not in ('binary','categorical') or constraints is None:return
+    lo=constraints.get('minimum_probability');hi=constraints.get('maximum_probability')
+    if (type(lo) not in (int,float) or type(hi) not in (int,float)
+            or not math.isfinite(lo) or not math.isfinite(hi) or not 0<=lo<=hi<=1):
+        raise Stop('Invalid submission probability constraints')
+    values=[d['probability']] if d['kind']=='binary' else d['probabilities'].values()
+    if any(type(v) not in (int,float) or not math.isfinite(v) or not lo<=v<=hi for v in values):
+        raise Stop('Probability outside supplied submission limits; no clipping')
 
 def review_payload(question,answer,documents):
     p=old_review(question,answer,documents)

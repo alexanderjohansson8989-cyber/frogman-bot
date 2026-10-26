@@ -4,7 +4,7 @@ No HTTP transport or credentials. Default submission is disabled. The driver
 is exercised only with simulated transports in this development version.
 Sources checked 2026-10-15: official backend common.py, OpenAPI, bot template.
 """
-import copy,datetime as dt,html,json,math
+import copy,datetime as dt,html,json,math,hashlib
 from autonomous_runner import distribution_check
 from bounded_evidence import digest
 from bounded_pipeline import audit_documents
@@ -17,7 +17,7 @@ from numeric_diagnostics_v1 import projection_diagnostics
 from independent_runner import Stop
 from operations_ledger_v1 import GlobalStop,readback_scope
 
-VERSION='competition-adapter-v3'
+VERSION='competition-adapter-v4-bounded-source-comments'
 TYPES=('binary','multiple_choice','numeric','discrete')
 
 def positive_id(n):
@@ -193,9 +193,19 @@ def prepare(binding,result):
         adaptation=numeric_adaptation(d,fields)
         field={'continuous_cdf':adaptation['continuous_cdf']};expected=field['continuous_cdf']
     urls=list(dict.fromkeys(f['url'] for f in a['facts']))
-    if any(not isinstance(u,str) or not u.startswith('https://') or len(u)>300 for u in urls):raise Stop('Bounded cited source URLs required')
-    sources='\n\nSources:\n'+'\n'.join(urls)
+    if any(not isinstance(u,str) or not u.startswith('https://') or len(u)>2048 for u in urls):raise Stop('Bounded cited source URLs required')
+    # Only comment presentation changes. Never shorten a URL into a different link.
+    displayed=[];omitted=[]
+    for u in urls:
+        escaped=html.escape(u)
+        if len(escaped)<=300:displayed.append(escaped)
+        else:
+            url_sha256=hashlib.sha256(u.encode('utf-8')).hexdigest()
+            omitted.append(dict(url_sha256=url_sha256,reason='comment_source_length'))
+            displayed.append('[Source URL omitted for length; SHA256 '+url_sha256+']')
+    sources='\n\nSources:\n'+'\n'.join(displayed)
     rationale,comment_adaptation=short_comment_rationale(a['rationale'],escaped_limit=1500-len(sources))
+    if omitted:comment_adaptation=dict(comment_adaptation or {},source_url_omissions=omitted)
     comment=html.escape(rationale)+sources
     if len(comment)>1500:raise Stop('Comment too long')
     plan=dict(version=VERSION,binding=copy.deepcopy(binding),answer_sha256=digest(a),
